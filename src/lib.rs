@@ -4,7 +4,7 @@ use flate2::read::ZlibDecoder;
 use std::{
     any::{type_name, Any},
     cell::{Ref, RefCell, RefMut},
-    convert::TryInto,
+    convert::{TryFrom, TryInto},
     fmt,
     io::{Read, Seek, SeekFrom},
     ops::Deref,
@@ -438,6 +438,17 @@ pub trait KStream {
         Ok(res)
     }
 
+    fn substream(&self, len: usize) -> BytesReader {
+        let reader = self.clone();
+
+        let limit = reader.pos() + len;
+        let mut state = reader.get_state_mut();
+        state.max_pos = Some(std::cmp::min(limit, state.max_pos.unwrap_or(limit)));
+        drop(state);
+
+        reader
+    }
+
     fn read_bytes(&self, len: usize) -> KResult<Vec<u8>>;
     fn read_bytes_full(&self) -> KResult<Vec<u8>>;
 
@@ -477,6 +488,7 @@ pub trait KStream {
 #[derive(Default, Debug, Clone)]
 pub struct ReaderState {
     pos: usize,
+    max_pos: Option<usize>,
     bits: u64,
     bits_left: i32,
 }
@@ -518,6 +530,13 @@ impl From<&[u8]> for BytesReader {
     }
 }
 
+impl TryFrom<Box<dyn ReadSeek>> for BytesReader {
+    type Error = KError;
+    fn try_from(reader: Box<dyn ReadSeek>) -> KResult<BytesReader> {
+        BytesReader::from_reader(reader)
+    }
+}
+
 impl BytesReader {
     pub fn open<T: AsRef<Path>>(filename: T) -> KResult<Self> {
         let f = std::fs::File::open(filename)?;
@@ -540,12 +559,23 @@ impl BytesReader {
         }
     }
 
+    fn from_reader(reader: Box<dyn ReadSeek>) -> KResult<Self> {
+        let mut reader = reader;
+
+        let file_size = reader.stream_position()?;
+        reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        Ok(BytesReader {
+            state: RefCell::new(ReaderState::default()),
+            file_size,
+            buf: OptRc::from(RefCell::new(reader)),
+        })
+    }
+
     // sync stream pos with state.pos
     fn sync_pos(&self) -> KResult<()> {
-        let cur_pos = self
-            .buf
-            .borrow_mut()
-            .stream_position()?;
+        let cur_pos = self.buf.borrow_mut().stream_position()?;
         if self.pos() != cur_pos as usize {
             self.buf
                 .borrow_mut()
@@ -569,7 +599,10 @@ impl KStream for BytesReader {
     }
 
     fn size(&self) -> usize {
-        self.file_size as usize
+        match self.get_state().max_pos {
+            Some(pos) => pos,
+            None => self.file_size as usize,
+        }
     }
 
     fn read_bytes(&self, len: usize) -> KResult<Vec<u8>> {
@@ -585,22 +618,20 @@ impl KStream for BytesReader {
         // let state = self.state.borrow_mut();
         // state.buf.resize(len, 0);
         let mut buf = vec![0; len];
-        self
-            .buf
-            .borrow_mut()
-            .read_exact(&mut buf[..])?;
+        self.buf.borrow_mut().read_exact(&mut buf[..])?;
         self.get_state_mut().pos += len;
         Ok(buf)
     }
 
     fn read_bytes_full(&self) -> KResult<Vec<u8>> {
+        if self.get_state().max_pos.is_some() {
+            return self.read_bytes(self.size().saturating_sub(self.pos()));
+        }
+
         self.sync_pos()?;
         //let state = self.state.borrow_mut();
         let mut buf = Vec::new();
-        let readed = self
-            .buf
-            .borrow_mut()
-            .read_to_end(&mut buf)?;
+        let readed = self.buf.borrow_mut().read_to_end(&mut buf)?;
         self.get_state_mut().pos += readed;
         Ok(buf)
     }
@@ -623,7 +654,8 @@ pub fn bytes_terminate(bytes: &Vec<u8>, term: u8, include_term: bool) -> Vec<u8>
         &bytes[..term_index + if include_term { 1 } else { 0 }]
     } else {
         bytes
-    }.to_vec()
+    }
+    .to_vec()
 }
 
 pub fn bytes_to_str(bytes: &Vec<u8>, label: &str) -> KResult<String> {
@@ -765,6 +797,32 @@ mod tests {
             reader.read_bits_int_be(65).unwrap_err(),
             KError::ReadBitsTooLarge { requested: 65 }
         )
+    }
+
+    #[test]
+    fn read_substream() {
+        let b: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let reader = BytesReader::from(b);
+        assert_eq!(reader.read_bytes(3).unwrap()[..], [1, 2, 3]);
+
+        let sub = reader.substream(4);
+        assert_eq!(
+            sub.read_bytes(5).unwrap_err(),
+            KError::Eof {
+                requested: 5,
+                available: 4
+            }
+        );
+        let sub = sub.substream(5);
+        assert_eq!(
+            sub.read_bytes(5).unwrap_err(),
+            KError::Eof {
+                requested: 5,
+                available: 4
+            }
+        );
+        assert_eq!(sub.read_bytes(4).unwrap()[..], [4, 5, 6, 7]);
+        assert_eq!(reader.read_bytes(4).unwrap()[..], [4, 5, 6, 7]);
     }
 
     #[test]
